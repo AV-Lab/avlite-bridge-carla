@@ -23,7 +23,7 @@ c40_community_plugins:
 c40_bridge: CarlaBridge
 ```
 
-Plugin settings: `~/.config/avlite/plugin_avlite-bridge-carla.yaml` (defaults in `config/default.yaml`).
+Plugin settings: `~/.config/avlite/plugin_avlite-bridge-carla.yaml`. Shipped defaults (monorepo / AVLite clone): `configs/plugin_avlite-bridge-carla.yaml`.
 
 ## Requirements
 
