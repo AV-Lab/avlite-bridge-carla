@@ -1,0 +1,3 @@
+numpy>=2.0
+# CARLA Python API — install from your CARLA release, e.g.:
+# pip install <path-to-carla>/PythonAPI/carla/dist/carla-*-py3*.whl
