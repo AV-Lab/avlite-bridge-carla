@@ -1,6 +1,6 @@
 from avlite.c40_execution.c41_world_bridge import WorldBridge
-from avlite.c60_common.c61_capabilities import WorldCapability
-from avlite.c60_common.c62_sensor_data import DepthImage, LidarCloud, RgbImage, SensorFrame
+from avlite.c50_common.c51_capabilities import StackCapability, WorldCapability
+from avlite.c50_common.c52_sensor_datatypes import DepthImage, LidarCloud, RgbImage, SensorFrame
 from avlite.c10_perception.c11_perception_model import EgoState, AgentState
 from avlite.c10_perception.c11_perception_model import PerceptionModel
 from avlite.c30_control.c31_control_model import ControlCommand
@@ -30,13 +30,18 @@ except ImportError:
 
 class Carla5Bridge(WorldBridge):
     @property
-    def capabilities(self) -> set[WorldCapability]:
+    def world_capabilities(self) -> set[WorldCapability]:
         return {
-            WorldCapability.GT_DETECTION,
-            WorldCapability.GT_TRACKING,
-            WorldCapability.GT_LOCALIZATION,
             WorldCapability.CAMERA_RGB,
-            WorldCapability.LIDAR_3D
+            WorldCapability.LIDAR_3D,
+        }
+
+    @property
+    def stack_capabilities(self) -> set[StackCapability]:
+        return {
+            StackCapability.DETECTION,
+            StackCapability.TRACKING,
+            StackCapability.LOCALIZATION,
         }
 
     def __init__(
