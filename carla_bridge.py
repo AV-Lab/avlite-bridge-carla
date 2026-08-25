@@ -12,6 +12,7 @@ from avlite import (
     WorldBridge,
     WorldCapability,
 )
+from avlite.c50_common.c52_world_sensor_datatypes import CameraParams
 from typing import Union
 import math
 import logging
@@ -19,6 +20,9 @@ import numpy as np
 import time
 import threading
 from typing import Optional
+
+from .settings import PluginSettings
+
 log = logging.getLogger(__name__)
 
 # LiDAR sensor defaults
@@ -30,12 +34,92 @@ LIDAR_UPPER_FOV = 10.0
 LIDAR_LOWER_FOV = -30.0
 LIDAR_Z_OFFSET = 2.4          # sensor height above vehicle origin
 
+# Camera sensor defaults 
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FOV = 90.0
+CAM_X = 1.5          # metres forward of the vehicle origin
+CAM_Y = 0.0
+CAM_Z = 1.4          # metres above the vehicle origin
+CAM_PITCH = 0.0      # degrees; forward-facing, upright mount
+CAM_YAW = 0.0
+
+# In async mode, LiDAR and RGB arrive from independent CARLA callback threads with
+# no shared clock. get_sensor_frame() warns when their frame numbers diverge past
+# this — a torn RGB/LiDAR pair projects wrong whenever ego or an object is moving.
+SENSOR_SKEW_TOLERANCE_FRAMES = 2
+
 try:
     import carla
 except ImportError:
     log.error("Carla module not found. Please ensure you have the Carla Python API installed if you need to integrate with Carla.")
 
-class Carla5Bridge(WorldBridge):
+
+# ------------------------------------------------------------------
+# World -> ego -> camera-optical transform, for CameraParams.world_to_camera.
+#
+# AVLite's world frame is x-forward/y-left/z-up (REP-103); CameraParams.world_to_camera
+# must land in OpenCV optical axes (x-right, y-down, z-forward). The camera is rigidly
+# mounted on the moving ego vehicle, so this has to be recomposed from the ego's current
+# pose every call, not cached like a fixed calibration matrix. This intentionally mirrors
+# (not imports — a world bridge shouldn't depend on a specific perception plugin)
+# perception_avlite/frames.py's independently-tested world_to_camera_transform(), so any
+# consumer of CameraParams gets identical semantics regardless of which side computed it.
+# ------------------------------------------------------------------
+_MOUNT_TO_OPTICAL_AXES = np.array([
+    [0.0, -1.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [1.0, 0.0, 0.0],
+])
+
+
+def _rotation_z(theta: float) -> np.ndarray:
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([
+        [c, -s, 0.0],
+        [s, c, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+
+
+def _rotation_pitch_yaw(pitch: float, yaw: float) -> np.ndarray:
+    """Extrinsic Rz @ Ry rotation (roll always 0 for this bridge's mount), radians."""
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rot_y = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    rot_z = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    return rot_z @ rot_y
+
+
+def _invert_rigid_transform(transform: np.ndarray) -> np.ndarray:
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+    inverse = np.eye(4)
+    inverse[:3, :3] = rotation.T
+    inverse[:3, 3] = -rotation.T @ translation
+    return inverse
+
+
+def _world_to_camera_optical(ego_state) -> np.ndarray:
+    """(4, 4) world -> camera-optical transform for the current ego pose and this
+    bridge's static CAM_X/Y/Z/PITCH/YAW mount config."""
+    ego_to_world = np.eye(4)
+    ego_to_world[:3, :3] = _rotation_z(ego_state.theta)
+    ego_to_world[:3, 3] = [ego_state.x, ego_state.y, ego_state.z]
+    world_to_ego = _invert_rigid_transform(ego_to_world)
+
+    mount_rotation = _rotation_pitch_yaw(math.radians(CAM_PITCH), math.radians(CAM_YAW))
+    # A vehicle-frame direction expressed relative to the (still vehicle-oriented) mount
+    # frame is R_mount^T @ v -- R_mount is orthogonal, so its inverse is its transpose.
+    cam_rotation = _MOUNT_TO_OPTICAL_AXES @ mount_rotation.T
+    cam_translation = -cam_rotation @ np.array([CAM_X, CAM_Y, CAM_Z])
+    ego_to_cam_optical = np.eye(4)
+    ego_to_cam_optical[:3, :3] = cam_rotation
+    ego_to_cam_optical[:3, 3] = cam_translation
+
+    return ego_to_cam_optical @ world_to_ego
+
+class Carla4Bridge(WorldBridge):
     @property
     def world_capabilities(self) -> set[WorldCapability]:
         return {
@@ -55,6 +139,8 @@ class Carla5Bridge(WorldBridge):
         self, ego_state: Optional[EgoState], host="localhost", port=2000, scene_name="/Game/Carla/Maps/Town10HD_Opt", timeout=10.0,
         controller: Optional[ControlStrategy] = None,
         reference_point: tuple[float, float] | None = None,
+        sync_mode: Optional[bool] = None,
+        fixed_delta_seconds: Optional[float] = None,
     ):
         self.supports_ground_truth_detection = True
         self.supports_ground_truth_localization = True
@@ -64,6 +150,14 @@ class Carla5Bridge(WorldBridge):
         self.world = None
         self.ego_state = ego_state
         self.controller = controller
+
+        # Sync mode: the server only advances one fixed-size step per explicit
+        # world.tick() call. Off by default to keep existing behavior.
+        self.sync_mode = sync_mode if sync_mode is not None else PluginSettings.sync_mode
+        self.fixed_delta_seconds = (
+            fixed_delta_seconds if fixed_delta_seconds is not None else PluginSettings.fixed_delta_seconds
+        )
+        self._tick_lock = threading.Lock()
 
         # Carla stuff
         self.vehicle = None
@@ -85,6 +179,20 @@ class Carla5Bridge(WorldBridge):
         self._lidar_buffer: Optional[np.ndarray] = None   # (N,4) world-frame [x,y,z,intensity]
         self._rgb_buffer: Optional[np.ndarray] = None      # (H,W,3) uint8
         self._depth_buffer: Optional[np.ndarray] = None    # (H,W) float32 metres
+        # (carla frame number, carla sim-time seconds) of whatever's currently in each
+        # buffer above — lets __wait_for_sensor_frame() (sync) and get_sensor_frame()'s
+        # skew check (async) tell whether a buffer is current or stale.
+        self._lidar_stamp: Optional[tuple[int, float]] = None
+        self._rgb_stamp: Optional[tuple[int, float]] = None
+        # Async mode only: each _on_lidar callback delivers just the arc swept since
+        # the last server tick, not a full rotation (the server free-runs at whatever
+        # FPS it's hitting, decoupled from LIDAR_ROTATION_FREQUENCY). These accumulate
+        # consecutive callbacks' points across one rotation period before publishing a
+        # complete sweep to _lidar_buffer. Unused in sync mode, where rotation_frequency
+        # is set so a single callback per tick already is a full sweep.
+        self._lidar_accum: list[np.ndarray] = []
+        self._lidar_sweep_start_ts: Optional[float] = None
+        self._lidar_rotation_frequency: float = LIDAR_ROTATION_FREQUENCY
         self.use_static_objects = False  # Use static objects in perception model
         self.static_vehicle_labels = (
                 carla.CityObjectLabel.Car,
@@ -100,12 +208,15 @@ class Carla5Bridge(WorldBridge):
         try:
             self.client = carla.Client(host, port)
             self.client.set_timeout(timeout)
-            log.info(f"Available maps: {self.client.get_available_maps()}")
-
-            if scene_name not in self.client.get_available_maps():
-                raise ValueError(f"Scene {scene_name} not found in available maps.")
+            # get_available_maps() returns a boost::python::list; on this build that
+            # constructor segfaults (PyList_New crash inside libcarla.so) even though
+            # scalar/string RPCs like get_server_version() work fine. load_world()
+            # itself raises a clean RuntimeError for an unknown map name, so skip the
+            # list-returning validation call entirely rather than crash the process.
             self.world = self.client.load_world(scene_name)
             log.info(f"Connected to Carla at {host}:{port} and loaded scene {scene_name}")
+
+            self.__configure_sync_mode()
 
             # Get the spectator to control the camera
             self.spectator = self.world.get_spectator()
@@ -113,15 +224,86 @@ class Carla5Bridge(WorldBridge):
             self.spawn_points = self.world.get_map().get_spawn_points()
             log.info(f"Found {len(self.spawn_points)} spawn points in the map")
 
-            spawn_npc_vehicles(self.world, num_vehicles=10)  
+            spawn_npc_vehicles(self.world, num_vehicles=10)
             # Initialize vehicle blueprint
             self.__initialize_vehicle_blueprint()
-            self.start_bg_camera_and_state_update()
+
+            # In sync mode the world only advances when control_ego_state() ticks it,
+            # so the camera/state follow is driven from there instead of a free-running
+            # background thread (which would poll at wall-clock rate, decoupled from sim
+            # time, defeating the point of a fixed, deterministic step).
+            if not self.sync_mode:
+                self.start_bg_camera_and_state_update()
 
         except Exception as e:
             log.error(f"Failed to connect to Carla: {e}")
             log.error("Make sure the Carla simulator is running on the specified host and port.")
 
+
+    def __configure_sync_mode(self):
+        """Put the CARLA server (and its traffic manager) into synchronous, fixed-timestep
+        mode, so the world only advances via explicit tick() calls from this bridge
+        instead of the server's free-running real-time clock. No-op in async mode.
+        """
+        if not self.sync_mode or not self.world:
+            return
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = self.fixed_delta_seconds
+        self.world.apply_settings(settings)
+
+        # NPC autopilot (spawn_npc_vehicles) is driven by the traffic manager, which
+        # has its own sync flag independent of the world's.
+        traffic_manager = self.client.get_trafficmanager()
+        traffic_manager.set_synchronous_mode(True)
+        log.info(f"Carla synchronous mode enabled (fixed_delta_seconds={self.fixed_delta_seconds})")
+
+    def __tick(self):
+        """Advance the world by one fixed step in sync mode; no-op in async mode
+        (the server advances on its own real-time clock there)."""
+        if not self.sync_mode or not self.world:
+            return
+        with self._tick_lock:
+            frame = self.world.tick()
+            self.__update_camera_position_and_state()
+            self.__wait_for_sensor_frame(frame)
+
+    def __wait_for_sensor_frame(self, frame, timeout=1.0):
+        """Block until every attached sensor has a buffer stamped >= *frame*.
+
+        world.tick() returns as soon as the server has stepped physics — it does not
+        wait for sensor callbacks, which land slightly later on CARLA's own listener
+        threads. Without this, code that reads get_lidar_data()/get_rgb_image() right
+        after __tick() can still see the previous frame's data. Only meaningful in
+        sync mode, where exactly one callback per sensor is expected per tick.
+        """
+        deadline = time.time() + timeout
+        for sensor, stamp_attr, lock in (
+            (self._lidar_sensor, "_lidar_stamp", self._lidar_lock),
+            (self._rgb_sensor, "_rgb_stamp", self._rgb_lock),
+        ):
+            if sensor is None:
+                continue
+            while True:
+                with lock:
+                    stamp = getattr(self, stamp_attr)
+                if stamp is not None and stamp[0] >= frame:
+                    break
+                if time.time() >= deadline:
+                    log.warning(f"Timed out waiting for {stamp_attr} to reach frame {frame}")
+                    break
+                time.sleep(0.001)
+
+    def step(self, dt: Optional[float] = 0.01) -> None:
+        """Public WorldBridge hook to advance the world without a control command.
+
+        AVLite's executers never call this today — control_ego_state() already ticks
+        the world every control cycle in sync mode, so nothing extra is needed there.
+        This exists for callers driving Carla4Bridge directly (e.g. a script that only
+        spawns agents / reads ground truth and never calls control_ego_state()) and
+        still wants sync mode's deterministic, one-step-at-a-time stepping.
+        """
+        self.__tick()
 
     def start_bg_camera_and_state_update(self, interval=0.01):
         """Start a periodic update of the camera position"""
@@ -216,8 +398,11 @@ class Carla5Bridge(WorldBridge):
             log.warning("No spawn points found in Carla map! Using arbitrary spawn point.")
             spawn_point = carla.Transform(carla.Location(x=state.x, y=state.y, z=1.0))
 
-        # Try to spawn the vehicle
-        self.vehicle = self.world.spawn_actor(self.vehicle_blueprint, spawn_point)
+        # Try to spawn the vehicle. spawn_actor() raises RuntimeError on collision
+        # instead of returning None, which would skip the fallback loop below entirely
+        # (the exception propagates straight out of __spawn_vehicle) — try_spawn_actor()
+        # fails gracefully instead, so a collision here can actually reach the retry loop.
+        self.vehicle = self.world.try_spawn_actor(self.vehicle_blueprint, spawn_point)
 
         # If spawning fails, try other spawn points
         if not self.vehicle and self.spawn_points:
@@ -253,13 +438,33 @@ class Carla5Bridge(WorldBridge):
         lidar_bp.set_attribute('channels', str(LIDAR_CHANNELS))
         lidar_bp.set_attribute('range', str(LIDAR_RANGE))
         lidar_bp.set_attribute('points_per_second', str(LIDAR_POINTS_PER_SECOND))
-        lidar_bp.set_attribute('rotation_frequency', str(LIDAR_ROTATION_FREQUENCY))
+        if self.sync_mode:
+            # A full 360-degree sweep must complete in exactly one tick, or
+            # get_lidar_data() only ever returns partial (half, third, ...) sweeps.
+            lidar_rotation_frequency = 1.0 / self.fixed_delta_seconds
+        else:
+            lidar_rotation_frequency = LIDAR_ROTATION_FREQUENCY
+        self._lidar_rotation_frequency = lidar_rotation_frequency
+        lidar_bp.set_attribute('rotation_frequency', str(lidar_rotation_frequency))
         lidar_bp.set_attribute('upper_fov', str(LIDAR_UPPER_FOV))
         lidar_bp.set_attribute('lower_fov', str(LIDAR_LOWER_FOV))
         lidar_transform = carla.Transform(carla.Location(z=LIDAR_Z_OFFSET))
         self._lidar_sensor = self.world.spawn_actor(lidar_bp, lidar_transform, attach_to=self.vehicle)
         self._lidar_sensor.listen(self._on_lidar)
-        log.info(f"LiDAR sensor attached ({LIDAR_CHANNELS}ch, {LIDAR_RANGE}m range)")
+        log.info(f"LiDAR sensor attached ({LIDAR_CHANNELS}ch, {LIDAR_RANGE}m range, "
+                 f"{lidar_rotation_frequency}Hz rotation)")
+
+        rgb_bp = bp_lib.find('sensor.camera.rgb')
+        rgb_bp.set_attribute('image_size_x', str(CAMERA_WIDTH))
+        rgb_bp.set_attribute('image_size_y', str(CAMERA_HEIGHT))
+        rgb_bp.set_attribute('fov', str(CAMERA_FOV))
+        # Capture every simulation step rather than gating on wall-clock time, so the
+        # camera stays aligned with LiDAR (and with tick boundaries in sync mode).
+        rgb_bp.set_attribute('sensor_tick', '0.0')
+        camera_transform = carla.Transform(carla.Location(x=CAM_X, y=CAM_Y, z=CAM_Z),
+                                            carla.Rotation(pitch=CAM_PITCH, yaw=CAM_YAW))
+        self._rgb_sensor = self.world.spawn_actor(rgb_bp, camera_transform, attach_to=self.vehicle)
+        self._rgb_sensor.listen(self._on_rgb)
 
     def __destroy_sensors(self):
         """Destroy all sensor actors."""
@@ -275,8 +480,12 @@ class Carla5Bridge(WorldBridge):
         self._depth_sensor = None
         with self._lidar_lock:
             self._lidar_buffer = None
+            self._lidar_stamp = None
+        self._lidar_accum = []
+        self._lidar_sweep_start_ts = None
         with self._rgb_lock:
             self._rgb_buffer = None
+            self._rgb_stamp = None
         with self._depth_lock:
             self._depth_buffer = None
 
@@ -314,8 +523,39 @@ class Carla5Bridge(WorldBridge):
         pts_world[:, 1] *= -1.0
 
         result = np.column_stack([pts_world, data[:, 3]])  # (N,4)
-        with self._lidar_lock:
-            self._lidar_buffer = result
+
+        if self.sync_mode:
+            # rotation_frequency is set to 1/fixed_delta_seconds, so this single
+            # callback already is a complete 360° sweep — no accumulation needed.
+            with self._lidar_lock:
+                self._lidar_buffer = result
+                self._lidar_stamp = (measurement.frame, measurement.timestamp)
+            return
+
+        # Async mode: this callback only covers the arc swept since the last server
+        # tick, whatever that tick's wall-clock duration happened to be. Accumulate
+        # consecutive callbacks until a full rotation period has elapsed, then publish
+        # the concatenated sweep and start accumulating the next one.
+        if self._lidar_sweep_start_ts is None:
+            self._lidar_sweep_start_ts = measurement.timestamp
+        self._lidar_accum.append(result)
+
+        rotation_period = 1.0 / self._lidar_rotation_frequency
+        if measurement.timestamp - self._lidar_sweep_start_ts >= rotation_period:
+            complete_sweep = np.concatenate(self._lidar_accum, axis=0)
+            with self._lidar_lock:
+                self._lidar_buffer = complete_sweep
+                self._lidar_stamp = (measurement.frame, measurement.timestamp)
+            self._lidar_accum = []
+            self._lidar_sweep_start_ts = measurement.timestamp
+
+    def _on_rgb(self, image):
+        """Convert carla.Image (BGRA) to SensorFrame's (H,W,3) uint8 RGB convention."""
+        arr = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4)
+        rgb = arr[:, :, 2::-1]  # BGRA -> RGB, drop alpha
+        with self._rgb_lock:
+            self._rgb_buffer = rgb.copy()
+            self._rgb_stamp = (image.frame, image.timestamp)
 
     # ------------------------------------------------------------------
     # WorldBridge sensor overrides
@@ -333,15 +573,101 @@ class Carla5Bridge(WorldBridge):
         with self._depth_lock:
             return self._depth_buffer
 
+    def get_camera_intrinsics(self) -> Optional[np.ndarray]:
+        """3x3 intrinsic matrix K, derived from the same FOV/resolution
+        __attach_sensors() uses to actually spawn the camera."""
+        focal_length = CAMERA_WIDTH / (2.0 * math.tan(math.radians(CAMERA_FOV) / 2.0))
+        cx, cy = CAMERA_WIDTH / 2.0, CAMERA_HEIGHT / 2.0
+        return np.array([
+            [focal_length, 0.0,          cx],
+            [0.0,          focal_length, cy],
+            [0.0,          0.0,          1.0],
+        ], dtype=np.float32)
+    
+    def get_camera_extrinsics(self) -> Optional[np.ndarray]:
+        """4x4 camera-mount-relative-to-ego transform, built from the same
+        CAM_X/CAM_Y/CAM_Z/CAM_PITCH/CAM_YAW constants __attach_sensors() mounts
+        the camera with. This is the static mount offset, not a per-tick world
+        pose — unlike LiDAR/RGB it never needs recomputing after a tick.
+        """
+        yaw, pitch = math.radians(CAM_YAW), math.radians(CAM_PITCH)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        # Carla LH rotation (roll=0, matching the mount in __attach_sensors)
+        R_lh = np.array([
+            [cy * cp, -sy, cy * sp],
+            [sy * cp,  cy, sy * sp],
+            [    -sp, 0.0,      cp],
+        ], dtype=np.float32)
+        t_lh = np.array([CAM_X, CAM_Y, CAM_Z], dtype=np.float32)
+        # Carla LH -> AVLite RH: conjugate by the Y-reflection F=diag(1,-1,1) so
+        # the result stays a proper (det=+1) rotation in the new frame. Negating
+        # just the translation's Y (as done for lidar points/ego state elsewhere
+        # in this file) is only correct for points, not for a full rotation
+        # matrix — moot today since CAM_PITCH=CAM_YAW=0 makes R_lh the identity,
+        # but wrong in general if either mount angle is ever changed.
+        F = np.diag([1.0, -1.0, 1.0]).astype(np.float32)
+        R_rh = F @ R_lh @ F
+        t_rh = F @ t_lh
+        extrinsic = np.eye(4, dtype=np.float32)
+        extrinsic[:3, :3] = R_rh
+        extrinsic[:3, 3] = t_rh
+        return extrinsic
+
+    def get_camera_params(self) -> Optional[CameraParams]:
+        """Full CameraParams (intrinsic + world->camera-optical), recomputed from
+        the ego's current pose every call — see _world_to_camera_optical()."""
+        if self.ego_state is None:
+            return None
+        return CameraParams(
+            intrinsic=self.get_camera_intrinsics(),
+            world_to_camera=_world_to_camera_optical(self.ego_state),
+            width=CAMERA_WIDTH,
+            height=CAMERA_HEIGHT,
+        )
+
     def get_sensor_frame(self) -> SensorFrame:
-        """Return an atomic snapshot of buffered sensor data."""
+        """Return an atomic snapshot of buffered sensor data.
+
+        In sync mode __tick() already waits for both buffers to reach the current
+        tick's frame, so they're expected to match here. In async mode there's no
+        such guarantee — RGB and LiDAR arrive independently off the wall clock — so
+        this only warns on skew rather than blocking or dropping data.
+        """
         with self._rgb_lock:
             rgb = self._rgb_buffer
+            rgb_stamp = self._rgb_stamp
         with self._depth_lock:
             depth = self._depth_buffer
         with self._lidar_lock:
             lidar = self._lidar_buffer
-        return SensorFrame(rgb=rgb, depth=depth, lidar=lidar)
+            lidar_stamp = self._lidar_stamp
+
+        if rgb_stamp is not None and lidar_stamp is not None:
+            frame_skew = abs(rgb_stamp[0] - lidar_stamp[0])
+            if frame_skew > SENSOR_SKEW_TOLERANCE_FRAMES:
+                log.warning(
+                    f"RGB/LiDAR frame skew ({frame_skew} frames, rgb={rgb_stamp[0]} "
+                    f"lidar={lidar_stamp[0]}) exceeds tolerance "
+                    f"({SENSOR_SKEW_TOLERANCE_FRAMES}); this SensorFrame's rgb/lidar "
+                    f"pair may not describe the same instant."
+                )
+
+        # Sim-time acquisition stamp for the frame as a whole — the newer of the two
+        # if both are present, so a consumer checking staleness sees the worst case.
+        if rgb_stamp is not None and lidar_stamp is not None:
+            stamp = max(rgb_stamp[1], lidar_stamp[1])
+        elif rgb_stamp is not None:
+            stamp = rgb_stamp[1]
+        elif lidar_stamp is not None:
+            stamp = lidar_stamp[1]
+        else:
+            stamp = None
+
+        return SensorFrame(
+            rgb=rgb, depth=depth, lidar=lidar, stamp=stamp,
+            camera_params=self.get_camera_params(),
+        )
 
     def control_ego_state(self, cmd: ControlCommand, dt=0.01):
         """Update the ego state with the given command.
@@ -385,6 +711,10 @@ class Carla5Bridge(WorldBridge):
         # Ensure all parameters are of the correct type for the Carla API
         control = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake, reverse=bool(is_reverse))
         self.vehicle.apply_control(control)
+
+        # In sync mode the server won't apply that control (or advance physics) until
+        # we tick it; do so now so get_ego_state() below reflects this frame's update.
+        self.__tick()
 
         # Update self.ego_state from vehicle
         self.get_ego_state()
@@ -535,12 +865,15 @@ class Carla5Bridge(WorldBridge):
         # Reset the world's state if possible
         if self.client:
             try:
-                # Apply a tick to synchronize
-                self.world.tick()
+                # world.tick() is only valid in sync mode; in async mode the server
+                # advances on its own and this call would raise.
+                if self.sync_mode:
+                    self.world.tick()
 
-                # Reset the simulation to its initial state
-                # This is a more thorough reset than just destroying actors
-                self.world = self.client.reload_world()
+                # Reset the simulation to its initial state. reset_settings=False keeps
+                # our synchronous_mode/fixed_delta_seconds instead of reload_world()
+                # silently reverting the world to its (async) defaults.
+                self.world = self.client.reload_world(reset_settings=False)
 
                 # Get the spectator again after world reload
                 self.spectator = self.world.get_spectator()
@@ -551,6 +884,17 @@ class Carla5Bridge(WorldBridge):
                 # Set weather to clear day again
                 weather = carla.WeatherParameters.ClearNoon
                 self.world.set_weather(weather)
+
+                # reset_settings=False preserves carla.WorldSettings (synchronous_mode/
+                # fixed_delta_seconds), but the traffic manager is a separate CARLA
+                # subsystem with its own sync flag that reload_world() makes no
+                # documented guarantee about — re-apply rather than assume it survived.
+                self.__configure_sync_mode()
+
+                # __init__ always seeds the world with NPCs; reload_world() destroys
+                # them and reset() has no other way to bring them back, so respawn here
+                # too rather than leaving the world permanently empty after a reset.
+                spawn_npc_vehicles(self.world, num_vehicles=10)
 
                 # Re-initialize the vehicle blueprint
                 self.__initialize_vehicle_blueprint()
