@@ -4,6 +4,7 @@ from avlite import (
     ControlStrategy,
     DepthImage,
     EgoState,
+    Lidar,
     LidarCloud,
     PerceptionModel,
     RgbImage,
@@ -82,7 +83,11 @@ class Carla5Bridge(WorldBridge):
         self._lidar_lock = threading.Lock()
         self._rgb_lock = threading.Lock()
         self._depth_lock = threading.Lock()
-        self._lidar_buffer: Optional[np.ndarray] = None   # (N,4) world-frame [x,y,z,intensity]
+        self._lidar_buffer: Optional[np.ndarray] = None   # (N,4) lidar-frame [x,y,z,intensity]
+        # Static lidar mount in the ego body frame: same offset used to attach the sensor.
+        mount = np.eye(4)
+        mount[2, 3] = LIDAR_Z_OFFSET
+        self._lidar_mount = Lidar(base_to_sensor=mount)
         self._rgb_buffer: Optional[np.ndarray] = None      # (H,W,3) uint8
         self._depth_buffer: Optional[np.ndarray] = None    # (H,W) float32 metres
         self.use_static_objects = False  # Use static objects in perception model
@@ -184,60 +189,69 @@ class Carla5Bridge(WorldBridge):
             log.error("No vehicle blueprints available in Carla")
             self.vehicle_blueprint = None
 
+    # ------------------------------------------------------------------
+    # Handedness: CARLA/UE4 is left-handed (y right, yaw clockwise), AVLite is
+    # right-handed (y left, theta counter-clockwise). These two helpers are the
+    # only place the sign flip lives.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_carla_transform(x: float, y: float, theta: float, z: float) -> "carla.Transform":
+        """AVLite pose (map frame) → carla.Transform."""
+        return carla.Transform(
+            carla.Location(x=x, y=-y, z=z),
+            carla.Rotation(yaw=-math.degrees(theta)),
+        )
+
+    @staticmethod
+    def _sync_state(state: Union[EgoState, AgentState], transform: "carla.Transform") -> None:
+        """Write a carla.Transform into an AVLite state (x, y, theta)."""
+        state.x = transform.location.x
+        state.y = -transform.location.y
+        state.theta = -math.radians(transform.rotation.yaw)
+
+    def _nearest_spawn_point(self, state: Union[EgoState, AgentState]):
+        """CARLA spawn point closest to the AVLite pose, or None."""
+        if not self.spawn_points:
+            return None
+        return min(
+            self.spawn_points,
+            key=lambda p: (p.location.x - state.x) ** 2 + (p.location.y + state.y) ** 2,
+        )
+
     def __spawn_vehicle(self, state: Union[EgoState, AgentState]):
-        """Spawn the ego vehicle at the given state position"""
+        """Spawn the ego vehicle at the requested AVLite pose.
+
+        The nearest CARLA spawn point is used only for its ground height. If the
+        requested pose is blocked, fall back to that spawn point. Either way
+        ``state`` is synced to where the vehicle actually landed.
+        """
         if not self.world or not self.vehicle_blueprint:
             log.error("Cannot spawn vehicle: world not connected or blueprint not initialized")
             return
 
-        # Use a valid spawn point from Carla
-        if self.spawn_points:
-            # Find the closest spawn point to the requested state
-            closest_point = None
-            min_distance = float("inf")
-            for point in self.spawn_points:
-                distance = ((point.location.x - state.x) ** 2 + (point.location.y - state.y) ** 2) ** 0.5
-                if distance < min_distance:
-                    min_distance = distance
-                    closest_point = point
-
-            # If we're too far from any spawn point, just use the first one
-            if min_distance > 100.0:  # If more than 100 meters away
-                log.warning(f"Requested position is too far from any valid spawn point. Using first spawn point.")
-                spawn_point = self.spawn_points[0]
-            else:
-                spawn_point = closest_point
-
-            log.info(
-                f"Using spawn point at ({spawn_point.location.x}, {spawn_point.location.y}, {spawn_point.location.z})"
-            )
-
-        else:
-            log.warning("No spawn points found in Carla map! Using arbitrary spawn point.")
-            spawn_point = carla.Transform(carla.Location(x=state.x, y=state.y, z=1.0))
-
-        # Try to spawn the vehicle
-        self.vehicle = self.world.spawn_actor(self.vehicle_blueprint, spawn_point)
-
-        # If spawning fails, try other spawn points
-        if not self.vehicle and self.spawn_points:
-            log.warning("Failed to spawn at selected point. Trying other spawn points.")
-            for i, spawn_point in enumerate(self.spawn_points):
-                self.vehicle = self.world.try_spawn_actor(self.vehicle_blueprint, spawn_point)
-                if self.vehicle:
-                    log.info(f"Successfully spawned at alternative point {i}")
-                    # Update the state to match the spawn point
-                    state.x = spawn_point.location.x
-                    state.y = spawn_point.location.y
-                    state.theta = spawn_point.rotation.yaw * (3.14159 / 180.0)
-                    break
-
-            if not self.vehicle:
-                log.error("Failed to spawn vehicle at any spawn point!")
-
-        # Attach sensors once vehicle exists
+        nearest = self._nearest_spawn_point(state)
+        z = nearest.location.z + 0.5 if nearest is not None else 1.0
+        requested = self._to_carla_transform(state.x, state.y, state.theta, z)
+        self.vehicle = self.world.try_spawn_actor(self.vehicle_blueprint, requested)
         if self.vehicle:
-            self.__attach_sensors()
+            log.info(f"Spawned ego at requested pose ({state.x:.2f}, {state.y:.2f}, {state.theta:.2f})")
+        elif nearest is not None:
+            log.warning(
+                f"Requested pose ({state.x:.2f}, {state.y:.2f}) is blocked; falling back to nearest spawn point."
+            )
+            self.vehicle = self.world.try_spawn_actor(self.vehicle_blueprint, nearest)
+            if not self.vehicle:
+                for i, spawn_point in enumerate(self.spawn_points):
+                    self.vehicle = self.world.try_spawn_actor(self.vehicle_blueprint, spawn_point)
+                    if self.vehicle:
+                        log.info(f"Spawned at alternative spawn point {i}")
+                        break
+
+        if not self.vehicle:
+            log.error("Failed to spawn vehicle at any pose!")
+            return
+        self._sync_state(state, self.vehicle.get_transform())
+        self.__attach_sensors()
 
     # ------------------------------------------------------------------
     # Sensor lifecycle
@@ -284,46 +298,29 @@ class Carla5Bridge(WorldBridge):
     # Sensor callbacks (run on Carla's sensor thread)
     # ------------------------------------------------------------------
     def _on_lidar(self, measurement):
-        """Convert carla.LidarMeasurement to world-frame (N,4) numpy array with AVLite coord convention."""
-        # Raw data: each point is [x, y, z, intensity] in sensor-local frame
+        """Store carla.LidarMeasurement as an (N,4) array in the lidar's own frame.
+
+        Raw points are already sensor-local [x, y, z, intensity]; only the
+        handedness changes (CARLA/UE4 left-handed → AVLite right-handed, negate y).
+        The ego pose is never applied here — the stack composes it from its own
+        estimate via ``lidar_sensor.to_map``.
+        """
         data = np.frombuffer(measurement.raw_data, dtype=np.float32).reshape(-1, 4).copy()
-
-        # Sensor → world transform
-        st = measurement.transform
-        yaw = math.radians(st.rotation.yaw)
-        pitch = math.radians(st.rotation.pitch)
-        roll = math.radians(st.rotation.roll)
-
-        # Rotation matrix (Carla uses left-hand UE4 convention)
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        cp, sp = math.cos(pitch), math.sin(pitch)
-        cr, sr = math.cos(roll), math.sin(roll)
-        R = np.array([
-            [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
-            [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
-            [  -sp,           cp*sr,           cp*cr  ],
-        ], dtype=np.float32)
-
-        pts_local = data[:, :3]                       # (N,3)
-        pts_world = pts_local @ R.T                   # rotate to world
-        pts_world[:, 0] += st.location.x
-        pts_world[:, 1] += st.location.y
-        pts_world[:, 2] += st.location.z
-
-        # Carla LH → AVLite RH: negate Y
-        pts_world[:, 1] *= -1.0
-
-        result = np.column_stack([pts_world, data[:, 3]])  # (N,4)
+        data[:, 1] *= -1.0
         with self._lidar_lock:
-            self._lidar_buffer = result
+            self._lidar_buffer = data
 
     # ------------------------------------------------------------------
     # WorldBridge sensor overrides
     # ------------------------------------------------------------------
     def get_lidar_data(self) -> Optional[LidarCloud]:
-        """Return latest LiDAR point cloud as (N,4) [x,y,z,intensity] in AVLite world frame."""
+        """Return latest LiDAR point cloud as (N,4) [x,y,z,intensity] in the lidar frame."""
         with self._lidar_lock:
             return self._lidar_buffer
+
+    def get_lidar_sensor(self) -> Lidar:
+        """Static lidar mount in the ego body frame (z = LIDAR_Z_OFFSET)."""
+        return self._lidar_mount
 
     def get_rgb_image(self) -> Optional[RgbImage]:
         with self._rgb_lock:
@@ -341,7 +338,7 @@ class Carla5Bridge(WorldBridge):
             depth = self._depth_buffer
         with self._lidar_lock:
             lidar = self._lidar_buffer
-        return SensorFrame(rgb=rgb, depth=depth, lidar=lidar)
+        return SensorFrame(rgb=rgb, depth=depth, lidar=lidar, lidar_sensor=self._lidar_mount)
 
     def control_ego_state(self, cmd: ControlCommand, dt=0.01):
         """Update the ego state with the given command.
@@ -391,46 +388,27 @@ class Carla5Bridge(WorldBridge):
     
 
     def teleport_ego(self, x: float, y: float, theta: Optional[float] = None):
-        if not self.vehicle:
-            self.__spawn_vehicle(self.ego_state)
+        """Move the ego to an AVLite pose; ``theta`` None keeps the current heading."""
         self.ego_state.x = x
         self.ego_state.y = y
         if theta is not None:
-            self.ego_state.theta = -theta # theta is inversed in Carla and UE
+            self.ego_state.theta = theta
+        if not self.vehicle:
+            self.__spawn_vehicle(self.ego_state)  # spawns at ego_state, nothing more to do
+            return
+        z = self.vehicle.get_transform().location.z
+        self.vehicle.set_transform(
+            self._to_carla_transform(self.ego_state.x, self.ego_state.y, self.ego_state.theta, z)
+        )
 
-        if self.vehicle:
-            # Convert theta from radians to degrees for Carla
-            theta_deg = self.ego_state.theta * (180.0 / 3.14159) if theta else None
-            transform = carla.Transform(
-                carla.Location(x=x, y=-y, z=1.0),
-                carla.Rotation(yaw=theta_deg) if theta_deg is not None else carla.Rotation()
-            )
-            self.vehicle.set_transform(transform)
-
-    
-    # TODO: Carla transformation
     def get_ego_state(self):
-        """Get the current state of the ego vehicle.
-        The method handles the difference of left-hand rule of Carla to right-hand rule of AVLite. 
-        """
+        """Read the ego pose and speed back from CARLA into ``ego_state`` (AVLite handedness)."""
         if not self.vehicle:
             self.__spawn_vehicle(self.ego_state)
-        transform = self.vehicle.get_transform()
         velocity = self.vehicle.get_velocity()
-        
-        # Log the raw transform data for debugging
-        # log.debug(f"Vehicle Transform: Location({transform.location.x}, {transform.location.y}, {transform.location.z}), "
-                  # f"Rotation({transform.rotation.pitch}, {transform.rotation.yaw}, {transform.rotation.roll})")
-        
-        self.ego_state.x = transform.location.x
-        self.ego_state.y = -1*transform.location.y
-        self.ego_state.theta = -transform.rotation.yaw * (3.14159 / 180.0)
+        self._sync_state(self.ego_state, self.vehicle.get_transform())
         self.ego_state.velocity = (velocity.x**2 + velocity.y**2) ** 0.5
         log.debug(f"Updated Ego State: x={self.ego_state.x}, y={self.ego_state.y}, theta={self.ego_state.theta}, velocity={self.ego_state.velocity}")
-#
-        # self.__update_camera_position_and_state()
-
-
         return self.ego_state
 
     def spawn_agent(self, agent_state: AgentState):
@@ -498,8 +476,9 @@ class Carla5Bridge(WorldBridge):
     
     def reset(self):
         """Reset the simulator and state.
-        This method destroys the current vehicle, resets the simulation,
-        and prepares the environment for a new run.
+        Destroys the current vehicle and reloads the world. The ego is not
+        re-spawned here: the executer restores ``ego_state`` to its start pose
+        right after this call, and the next tick spawns lazily at that pose.
         """
         log.info("Resetting Carla simulation...")
 
