@@ -81,6 +81,13 @@ class CarlaSensorFrame(SensorFrame):
 
 
 class Carla4Bridge(WorldBridge):
+    def _require_ego_agent(self, agent_id, source):
+        """Reject per-agent sensor access; this bridge currently serves ego only."""
+        if agent_id != EGO_AGENT_ID:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support {source} for agent {agent_id}"
+            )
+
     @property
     def world_capabilities(self):
         return {WorldCapability.CAMERA_RGB, WorldCapability.LIDAR_3D}
@@ -144,7 +151,7 @@ class Carla4Bridge(WorldBridge):
         try:
             self.client = carla.Client(host, port)
             self.client.set_timeout(timeout)
-            # Avoid the list-returning RPC that crashed the user's libcarla build.
+            # Avoid the list-returning RPC, which crashes in some libcarla builds.
             self.world = self.client.load_world(scene_name)
             self._original_settings = self.world.get_settings()
             self.__configure_sync_mode()
