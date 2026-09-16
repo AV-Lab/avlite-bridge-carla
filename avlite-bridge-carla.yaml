@@ -1,0 +1,55 @@
+c10_perception:
+  c12_detection_strategy: ''
+  c12_prediction_strategy: ConstantVelocityPrediction
+  c12_tracking_strategy: ''
+
+c40_execution:
+  c40_bridge: Carla4Bridge
+  c40_control_dt: 0.05
+  c40_controller: KeyboardController
+  c40_executer_type: SyncExecuter
+  c40_execution_tasks: []
+  c40_global_planner: ''
+  c40_global_trajectory: ''
+  c40_local_planner: ''
+  c40_localization: ''
+  c40_localization_dt: 0.05
+  c40_log_level: INFO
+  c40_log_to_file: false
+  c40_map: ''
+  c40_mapping: ''
+  c40_pace_control: true
+  c40_pace_perception: true
+  c40_pace_replan: true
+  c40_pace_sim: true
+  c40_perception: PerceptionPipeline
+  c40_perception_dt: 0.05
+  c40_reference_point: null
+  c40_replan_dt: 0.05
+  c40_sim_dt: 0.05
+  c40_start_pose: null
+  c41_world_capabilities:
+    - CAMERA_RGB
+    - LIDAR_3D
+  c41_world_stack_capabilities:
+    - DETECTION
+    - TRACKING
+    - LOCALIZATION
+
+c69_apps:
+  c60_selected_profile: avlite-bridge-carla
+  c62_community_plugins:
+    avlite-bridge-carla: avlite-bridge-carla
+  c62_default_plugins:
+    - p60_headless_mode
+    - p60_setting_cli
+    - p60_visualizer_tk
+  c62_load_plugins: true
+
+plugins:
+  avlite-bridge-carla:
+    max_sensor_age: 0.5
+    seed: 0
+    sensor_queue_size: 64
+    sensor_timeout: 2.0
+    sync_mode: true
