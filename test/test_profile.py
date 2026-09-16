@@ -3,6 +3,8 @@ from pathlib import Path
 import yaml
 
 from avlite.c10_perception.c19_settings import PerceptionSettingsSchema
+from avlite.c20_planning.c29_settings import PlanningSettingsSchema
+from avlite.c30_control.c39_settings import ControlSettingsSchema
 from avlite.c40_execution.c49_settings import ExecutionSettingsSchema
 from avlite.c60_apps.c69_settings import AppSettingsSchema
 
@@ -29,6 +31,8 @@ def test_recommended_profile_is_portable_and_valid():
     profile = yaml.safe_load(PROFILE_PATH.read_text())
 
     PerceptionSettingsSchema.model_validate(profile["c10_perception"])
+    PlanningSettingsSchema.model_validate(profile["c20_planning"])
+    ControlSettingsSchema.model_validate(profile["c30_control"])
     ExecutionSettingsSchema.model_validate(profile["c40_execution"])
     AppSettingsSchema.model_validate(profile["c69_apps"])
     PluginSettingsSchema.model_validate(profile["plugins"][PROFILE_NAME])
@@ -53,3 +57,16 @@ def test_recommended_profile_uses_carla_ground_truth():
         "TRACKING",
         "LOCALIZATION",
     }
+
+
+def test_recommended_profile_uses_town10_planning_setup():
+    profile = yaml.safe_load(PROFILE_PATH.read_text())
+    execution = profile["c40_execution"]
+
+    assert execution["c40_map"] == "data/Town10HD_Opt.xodr"
+    assert execution["c40_global_trajectory"] == "data/20260702_045340_global_plan.json"
+    assert execution["c40_global_planner"] == "HDMapGlobalPlanner"
+    assert execution["c40_local_planner"] == "ShortestPathLatticePlanner"
+    assert execution["c40_controller"] == "StanleyController"
+    assert execution["c40_pace_replan"] is False
+    assert not any("yas" in value.lower() for value in _strings(profile))
