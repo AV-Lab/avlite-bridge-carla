@@ -20,13 +20,15 @@ plugin Install or Update, AVLite offers to import it as the
 `avlite-bridge-carla` profile. Accept that prompt, select the profile, and start
 the stack after launching a compatible CARLA server.
 
-The recommended profile is an initial keyboard-driven CARLA setup:
+The recommended profile mirrors the tested Town10HD planning setup:
 
 - `Carla4Bridge` with `SyncExecuter` at a 0.05-second fixed step;
 - RGB camera and 3D LiDAR enabled;
 - CARLA ground-truth detection, tracking, and localization enabled;
 - `PerceptionPipeline` retained for prediction;
-- no external perception plugin, map, route, or autonomous planner required;
+- AVLite's bundled `Town10HD_Opt.xodr` map and recorded Town10HD route;
+- `HDMapGlobalPlanner`, `ShortestPathLatticePlanner`, and `StanleyController`;
+- no external perception or planning plugin required;
 - plugin settings stored under the registry name `avlite-bridge-carla`.
 
 AVLite treats the self-referencing plugin locator as a portable sentinel and
@@ -48,7 +50,12 @@ The recommended profile configures:
 ```yaml
 c40_execution:
   c40_bridge: Carla4Bridge
+  c40_controller: StanleyController
   c40_executer_type: SyncExecuter
+  c40_global_planner: HDMapGlobalPlanner
+  c40_global_trajectory: data/20260702_045340_global_plan.json
+  c40_local_planner: ShortestPathLatticePlanner
+  c40_map: data/Town10HD_Opt.xodr
   c40_pace_sim: true
   c40_sim_dt: 0.05
   c41_world_capabilities: [CAMERA_RGB, LIDAR_3D]
