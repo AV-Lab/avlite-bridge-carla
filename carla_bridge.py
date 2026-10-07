@@ -9,7 +9,10 @@ from dataclasses import dataclass, replace
 import atexit
 import logging
 import math
+import os
 import random
+import subprocess
+import sys
 import threading
 import time
 
@@ -22,10 +25,8 @@ from avlite import (
 from avlite.c10_perception.c11_perception_model import EGO_AGENT_ID
 from .settings import PluginSettings
 
-try:
-    import carla
-except ImportError:
-    carla = None
+# Tests inject carla before import. Otherwise __init__ imports it after python_api is applied.
+carla = sys.modules.get("carla")
 
 log = logging.getLogger(__name__)
 # importlib.reload retains module globals. Preserve ownership across GUI reloads.
@@ -80,7 +81,7 @@ class CarlaSensorFrame(SensorFrame):
     base_to_map: np.ndarray | None = None
 
 
-class Carla4Bridge(WorldBridge):
+class CarlaBridge(WorldBridge):
     def _require_ego_agent(self, agent_id, source):
         """Reject per-agent sensor access; this bridge currently serves ego only."""
         if agent_id != EGO_AGENT_ID:
@@ -102,8 +103,26 @@ class Carla4Bridge(WorldBridge):
         controller: ControlStrategy | None = None, reference_point=None,
         sync_mode: bool | None = None,
     ):
+        global carla
+        api = os.path.expanduser(str(getattr(PluginSettings, "python_api", "") or "").strip())
+        loaded = sys.modules.get("carla")
+        if api:
+            origin = os.path.abspath(getattr(loaded, "__file__", "") or "") if loaded is not None else ""
+            api_abs = os.path.abspath(api)
+            if loaded is not None and not (origin == api_abs or origin.startswith(api_abs + os.sep)):
+                raise RuntimeError(
+                    "CARLA Python API is already loaded from another path. Restart AVLite to use python_api."
+                )
+            if api_abs not in [os.path.abspath(entry) for entry in sys.path if entry]:
+                sys.path.insert(0, api)
+        if carla is None and loaded is not None and not api:
+            carla = loaded
         if carla is None:
-            raise ImportError("Install the CARLA Python API matching your CARLA server.")
+            try:
+                import carla as imported_carla
+            except ImportError as exc:
+                raise ImportError("Install the CARLA Python API matching your CARLA server.") from exc
+            carla = imported_carla
         self.ego_state = ego_state if ego_state is not None else EgoState()
         self.controller, self.reference_point = controller, reference_point
         self.supports_ground_truth_detection = self.supports_ground_truth_localization = True
@@ -115,6 +134,7 @@ class Carla4Bridge(WorldBridge):
             self.fixed_delta_seconds = ExecutionSettings.c40_sim_dt
         self.validate_avlite_timing()
         self.sensor_timeout = PluginSettings.sensor_timeout
+        self.block_timeout = self.sensor_timeout
         self.sensor_queue_size = PluginSettings.sensor_queue_size
         self.max_sensor_age = PluginSettings.max_sensor_age
         self.seed = PluginSettings.seed
@@ -127,6 +147,7 @@ class Carla4Bridge(WorldBridge):
         self._last_delivery = None
         self._sensor_started_at = None
         self._sync_fault = None
+        self._callbacks_in_flight = 0
         self._closed = False
         self._stop_event = threading.Event()
         self._camera_thread = None
@@ -149,8 +170,69 @@ class Carla4Bridge(WorldBridge):
         if previous is not None:
             previous.close()
         try:
+            # A mismatched extension aborts inside libcarla. Probe in a child so that
+            # abort stays out of this process. Fake clients used by tests have no .so.
+            if str(getattr(carla, "__file__", "")).endswith(".so"):
+                env = os.environ.copy()
+                if api:
+                    env["PYTHONPATH"] = os.path.abspath(api) + os.pathsep + env.get("PYTHONPATH", "")
+                script = (
+                    "import carla\n"
+                    "client = carla.Client(%r, %d)\n"
+                    "client.set_timeout(%r)\n"
+                    "print(client.get_client_version(), flush=True)\n"
+                    "print(client.get_server_version(), flush=True)\n"
+                ) % (host, int(port), float(timeout))
+                try:
+                    probe = subprocess.run(
+                        [sys.executable, "-c", script],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=float(timeout) + 5.0,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        "CARLA Python API version probe timed out. "
+                        "Check that the simulator is running and python_api matches it."
+                    ) from exc
+                detail = (probe.stderr or "").strip()
+                versions = [line.strip() for line in (probe.stdout or "").splitlines() if line.strip()]
+                client_version = versions[0] if versions else "unknown"
+                server_version = versions[1] if len(versions) > 1 else "unknown"
+                combined = f"{probe.stdout or ''}\n{detail}".lower()
+                if any(token in combined for token in ("connection refused", "time-out", "timed out")):
+                    message = (
+                        f"CARLA at {host}:{int(port)} is not accepting connections. "
+                        "Start the simulator and reload the stack."
+                    )
+                    if detail:
+                        message = f"{message}\n{detail}"
+                    raise RuntimeError(message)
+                if probe.returncode != 0 or len(versions) < 2 or client_version != server_version:
+                    message = (
+                        f"CARLA Python API {client_version} does not match server {server_version}. "
+                        "Install the Python API from the same CARLA release as the simulator "
+                        "into the environment that runs AVLite, or set python_api to that release's "
+                        "egg or directory and restart AVLite."
+                    )
+                    if detail:
+                        message = f"{message}\n{detail}"
+                    raise RuntimeError(message)
             self.client = carla.Client(host, port)
             self.client.set_timeout(timeout)
+            if not str(getattr(carla, "__file__", "")).endswith(".so"):
+                get_client_version = getattr(self.client, "get_client_version", None)
+                get_server_version = getattr(self.client, "get_server_version", None)
+                if callable(get_client_version) and callable(get_server_version):
+                    client_version = str(get_client_version())
+                    server_version = str(get_server_version())
+                    if client_version != server_version:
+                        raise RuntimeError(
+                            f"CARLA Python API {client_version} does not match server {server_version}. "
+                            "Install the Python API from the same CARLA release as the simulator "
+                            "into the environment that runs AVLite."
+                        )
             # Avoid the list-returning RPC, which crashes in some libcarla builds.
             self.world = self.client.load_world(scene_name)
             self._original_settings = self.world.get_settings()
@@ -171,9 +253,6 @@ class Carla4Bridge(WorldBridge):
         """Fail early for unsupported fixed-step AVLite configuration."""
         if not self.sync_mode:
             return
-        from avlite.c40_execution.c49_settings import ExecutionSettings
-        if not ExecutionSettings.c40_pace_sim:
-            raise ValueError("Synchronous CARLA requires c40_pace_sim: true")
         if not math.isfinite(self.fixed_delta_seconds) or self.fixed_delta_seconds <= 0:
             raise ValueError("AVLite c40_sim_dt must be finite and positive")
 
@@ -217,10 +296,9 @@ class Carla4Bridge(WorldBridge):
         self._npc_actors = spawn_npc_vehicles(self.world, num_vehicles=10, seed=self.seed)
 
     def _validate_dt(self, dt):
-        if self.sync_mode and dt is not None and (
-            not math.isfinite(dt) or
-            not math.isclose(dt, self.fixed_delta_seconds, rel_tol=1e-9, abs_tol=1e-12)
-        ):
+        # Synchronous CARLA ticks fixed_delta_seconds. AVLite may pass a wall-clock
+        # dt when pacing is off; that value does not change this tick.
+        if self.sync_mode and dt is not None and (not math.isfinite(dt) or dt <= 0):
             raise ValueError(
                 f"CARLA advances {self.fixed_delta_seconds}s per tick, but dt={dt} was requested"
             )
@@ -292,24 +370,40 @@ class Carla4Bridge(WorldBridge):
             self._sensor_condition.notify_all()
 
     def _on_lidar(self, measurement, generation=None):
-        generation = self._sensor_generation if generation is None else generation
-        points = np.frombuffer(measurement.raw_data, dtype=np.float32).reshape(-1, 4).copy()
-        points[:, 1] *= -1
-        # One callback is ONE CARLA instant. Do not accumulate moving scenes.
-        sensor = replace(
-            self._lidar_mount, points=_readonly(points), stamp=float(measurement.timestamp),
-        )
-        sensor_to_map = _REFLECTION @ np.asarray(measurement.transform.get_matrix()) @ _REFLECTION
-        body_to_map = sensor_to_map @ np.linalg.inv(self._lidar_mount.base_to_sensor)
-        self._record_sensor("lidar", int(measurement.frame), sensor, _readonly(body_to_map), generation)
+        with self._sensor_condition:
+            self._callbacks_in_flight += 1
+        try:
+            generation = self._sensor_generation if generation is None else generation
+            points = np.frombuffer(measurement.raw_data, dtype=np.float32).reshape(-1, 4).copy()
+            points[:, 1] *= -1
+            # One callback is ONE CARLA instant. Do not accumulate moving scenes.
+            sensor = replace(
+                self._lidar_mount, points=_readonly(points), stamp=float(measurement.timestamp),
+            )
+            sensor_to_map = _REFLECTION @ np.asarray(measurement.transform.get_matrix()) @ _REFLECTION
+            body_to_map = sensor_to_map @ np.linalg.inv(self._lidar_mount.base_to_sensor)
+            self._record_sensor("lidar", int(measurement.frame), sensor, _readonly(body_to_map), generation)
+        finally:
+            with self._sensor_condition:
+                self._callbacks_in_flight -= 1
+                if self._callbacks_in_flight == 0:
+                    self._sensor_condition.notify_all()
 
     def _on_rgb(self, image, generation=None):
-        generation = self._sensor_generation if generation is None else generation
-        raw = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4)
-        if (image.width, image.height) != (self._camera_mount.width, self._camera_mount.height):
-            raise ValueError("CARLA image resolution no longer matches camera calibration")
-        sensor = replace(self._camera_mount, rgb=_readonly(raw[:, :, 2::-1]), stamp=float(image.timestamp))
-        self._record_sensor("rgb", int(image.frame), sensor, None, generation)
+        with self._sensor_condition:
+            self._callbacks_in_flight += 1
+        try:
+            generation = self._sensor_generation if generation is None else generation
+            raw = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4)
+            if (image.width, image.height) != (self._camera_mount.width, self._camera_mount.height):
+                raise ValueError("CARLA image resolution no longer matches camera calibration")
+            sensor = replace(self._camera_mount, rgb=_readonly(raw[:, :, 2::-1]), stamp=float(image.timestamp))
+            self._record_sensor("rgb", int(image.frame), sensor, None, generation)
+        finally:
+            with self._sensor_condition:
+                self._callbacks_in_flight -= 1
+                if self._callbacks_in_flight == 0:
+                    self._sensor_condition.notify_all()
 
     def get_sensor_frame(self, agent_id=EGO_AGENT_ID):
         self._require_ego_agent(agent_id, "sensor frame")
@@ -449,18 +543,33 @@ class Carla4Bridge(WorldBridge):
     def __destroy_sensors(self):
         # Invalidate before stopping: late callbacks from the old actors are ignored.
         self._clear_captures()
+        sensors = []
         for attr in ("_lidar_sensor", "_rgb_sensor", "_depth_sensor"):
             sensor = getattr(self, attr)
             setattr(self, attr, None)
-            if sensor is not None:
-                try:
-                    sensor.stop()
-                except Exception:
-                    log.exception("Could not stop sensor")
-                try:
-                    sensor.destroy()
-                except Exception:
-                    log.exception("Could not destroy sensor")
+            if sensor is None:
+                continue
+            sensors.append(sensor)
+            try:
+                sensor.stop()
+            except Exception:
+                log.exception("Could not stop sensor")
+        deadline = time.monotonic() + self.sensor_timeout
+        with self._sensor_condition:
+            while self._callbacks_in_flight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning(
+                        "Destroying CARLA sensors with %s callback(s) still in flight",
+                        self._callbacks_in_flight,
+                    )
+                    break
+                self._sensor_condition.wait(remaining)
+        for sensor in sensors:
+            try:
+                sensor.destroy()
+            except Exception:
+                log.exception("Could not destroy sensor")
         self._lidar_mount = replace(self._lidar_mount, sensor_id=None)
         self._camera_mount = replace(self._camera_mount, sensor_id=None)
 
@@ -607,11 +716,19 @@ class Carla4Bridge(WorldBridge):
                     self._traffic_manager.set_synchronous_mode(False)
                 except Exception:
                     log.exception("Could not release Traffic Manager synchronous mode")
+                self._traffic_manager = None
             if self.world is not None and self._original_settings is not None:
                 try:
                     self.world.apply_settings(self._original_settings)
                 except Exception:
                     log.exception("Could not restore CARLA world settings")
+            # Drop the client after actors are gone so its streamer exits before
+            # the next bridge calls load_world. The world proxy keeps that
+            # streamer alive, so it is released here too.
+            self.spectator = None
+            self.world = None
+            self.client = None
+            self._original_settings = None
         if self._camera_thread is not None and self._camera_thread is not threading.current_thread():
             self._camera_thread.join(timeout=2)
         if _ACTIVE_BRIDGES.get(self._owner_key) is self:

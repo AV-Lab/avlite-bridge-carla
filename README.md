@@ -1,6 +1,6 @@
 # AVLite CARLA bridge
 
-`Carla4Bridge` connects AVLite to CARLA with synchronized RGB camera and 3D
+`CarlaBridge` connects AVLite to CARLA with synchronized RGB camera and 3D
 LiDAR captures. It supports synchronous fixed-step execution, asynchronous
 sensor delivery, CARLA ground-truth detection/tracking/localization, NPC
 spawning, and capture-time sensor geometry.
@@ -22,7 +22,7 @@ the stack after launching a compatible CARLA server.
 
 The recommended profile mirrors the tested Town10HD planning setup:
 
-- `Carla4Bridge` with `SyncExecuter` at a 0.05-second fixed step;
+- `CarlaBridge` with `SyncExecuter` at a 0.05-second fixed step;
 - RGB camera and 3D LiDAR enabled;
 - CARLA ground-truth detection, tracking, and localization enabled;
 - `PerceptionPipeline` retained for prediction;
@@ -40,8 +40,19 @@ c69_apps:
     avlite-bridge-carla: avlite-bridge-carla
 ```
 
-The CARLA Python API must match the running CARLA server. Install that API from
-the CARLA release rather than from this repository.
+One `CarlaBridge` talks to CarlaUE4 (0.9.x) and CarlaUnreal (0.10). Each server
+needs the Python API from that same release. A 0.10 client connected to a 0.9.16
+server aborts inside libcarla (`std::bad_array_new_length`), which Python cannot
+catch. The bridge therefore checks versions in a child process and does not open
+a client in AVLite when they differ or the child dies.
+
+Install the wheel shipped with that server, or point `python_api` at its `.egg`
+or directory and restart AVLite. One process loads one `carla` module. Empty
+`python_api` uses whatever `carla` is already on `sys.path`.
+
+```bash
+pip install /path/to/CARLA/PythonAPI/carla/dist/carla-<version>-cp310-cp310-linux_x86_64.whl
+```
 
 ## Synchronous execution
 
@@ -49,7 +60,7 @@ The recommended profile configures:
 
 ```yaml
 c40_execution:
-  c40_bridge: Carla4Bridge
+  c40_bridge: CarlaBridge
   c40_controller: StanleyController
   c40_executer_type: SyncExecuter
   c40_global_planner: HDMapGlobalPlanner
@@ -63,6 +74,7 @@ c40_execution:
 plugins:
   avlite-bridge-carla:
     sync_mode: true
+    python_api: ""
     sensor_timeout: 2.0
     sensor_queue_size: 64
     max_sensor_age: 0.5
@@ -70,9 +82,9 @@ plugins:
 ```
 
 In synchronous mode, the bridge takes CARLA's fixed step from `c40_sim_dt`.
-Simulation pacing must be enabled, and each explicit `dt` must match that fixed
-step. Recreate the bridge after changing `c40_sim_dt`; reset it after a failed
-sensor wait before advancing again.
+Each advance is one tick of that step, including when the caller passes a
+different `dt`. Recreate the bridge after changing `c40_sim_dt`; reset it after
+a failed sensor wait before advancing again.
 
 See [SYNC_ASYNC.md](SYNC_ASYNC.md) for the synchronization, timeout, clock, and
 lifecycle contracts.

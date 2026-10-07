@@ -27,13 +27,14 @@ let the core's elapsed-time counter drift. `close()` wakes blocked waiters.
 
 ## Clock policy
 
-Sync mode requires `c40_pace_sim=true` and a finite, positive `c40_sim_dt`. The
-bridge reads `c40_sim_dt` at construction and uses it as CARLA's
-`fixed_delta_seconds`; there is no separate plugin or constructor step-size
-setting. This applies to both factory-created bridges and explicit
-`sync_mode=True`. Every explicit `dt`
-must match that fixed step. Recreate the bridge after changing `c40_sim_dt`.
-Validation happens before simulation mutation.
+Sync mode requires a finite, positive `c40_sim_dt`. The bridge reads it at
+construction and uses it as CARLA's `fixed_delta_seconds`. Each call ticks that
+step once. AVLite may pass a wall-clock `dt` when pacing is off; the bridge does
+not change CARLA's step to follow it, and it does not reject that call. There is
+no separate plugin or constructor step-size setting. This applies to both
+factory-created bridges and explicit `sync_mode=True`. Recreate the bridge after
+changing `c40_sim_dt`. Validation of a non-finite or non-positive `dt` happens
+before simulation mutation.
 
 This is a bridge-side guard around a preexisting core limitation: the core counts
 requested dt, not the simulator's actual clock. It is not a general clock-interface
@@ -83,11 +84,20 @@ Late callbacks from those actors cannot populate a new episode, even when CARLA
 frame numbers restart. Sensor queues, faults and published captures are cleared.
 Reset preserves/reapplies world and Traffic Manager timing and restores NPCs.
 
-The spectator thread has a stop event and is joined on close. `close()` destroys
-owned actors and restores the pre-bridge world settings. Starting another bridge
-for the same server closes the previous owner, including across `importlib.reload()`.
+The spectator thread has a stop event and is joined on close. `close()` stops
+sensor actors, waits until callbacks that have entered Python return, then
+destroys those actors and the ego and NPC vehicles. It restores the pre-bridge
+world settings and drops the client and world proxy so the sensor stream exits
+before another bridge calls `load_world`. Starting another bridge for the same
+server closes the previous owner, including across `importlib.reload()`.
 An `atexit` hook closes active bridge owners when Python exits normally. A hard
 kill cannot run cleanup; CARLA may need its synchronous mode disabled externally.
+
+The client and server versions must match. For the installed CARLA extension the
+bridge checks versions in a child process before connecting, so a mismatch or
+abort cannot take down AVLite. Set `python_api` to the `.egg` or directory for
+CarlaUE4 or CarlaUnreal and restart AVLite to load that release. A 0.10 client
+must not connect in-process to a 0.9.16 server.
 
 NPC spawning never replaces the ego reference and accepts AVLite's `global_plan`
 keyword. Ego spawning/teleport use centralized handedness conversion, including

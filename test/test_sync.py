@@ -177,7 +177,7 @@ def module(monkeypatch):
 
 @pytest.fixture
 def bridge(module):
-    bridge = module.Carla4Bridge(module.EgoState(), sync_mode=True)
+    bridge = module.CarlaBridge(module.EgoState(), sync_mode=True)
     bridge.sensor_timeout = .2
     yield bridge
     bridge.close()
@@ -206,14 +206,20 @@ def test_no_tick_from_getters_and_empty_readings_keep_mounts(bridge):
     assert bridge.world.frame == 0
 
 
-def test_dt_mismatch_fails_before_any_server_step(bridge, module):
-    with pytest.raises(ValueError, match="dt=0.01"):
-        bridge.control_ego_state(module.ControlCommand(), dt=.01)
-    assert bridge.world.frame == 0 and bridge.vehicle is None
-    for _ in range(10):
+def test_mismatched_dt_still_ticks_configured_step(bridge, module):
+    bridge.control_ego_state(module.ControlCommand(), dt=.01)
+    assert bridge.world.frame == 1
+    assert bridge.world.elapsed == pytest.approx(.05)
+    for _ in range(9):
         bridge.control_ego_state(module.ControlCommand(), dt=.05)
     assert bridge.world.frame == 10
     assert bridge.world.elapsed == pytest.approx(.5)
+
+
+def test_invalid_dt_fails_before_any_server_step(bridge, module):
+    with pytest.raises(ValueError, match="dt=0"):
+        bridge.control_ego_state(module.ControlCommand(), dt=0)
+    assert bridge.world.frame == 0 and bridge.vehicle is None
 
 
 def test_timeout_is_latched_and_never_returns_stale_pair(bridge):
@@ -376,11 +382,13 @@ def test_teleport_preserves_unspecified_heading_and_invalidates_sensor_data(brid
 def test_close_stops_owned_sensors_thread_and_restores_settings(bridge):
     bridge.step(.05)
     actors = [bridge.vehicle, bridge._lidar_sensor, bridge._rgb_sensor]
+    world = bridge.world
     bridge.start_bg_camera_and_state_update()
     bridge.close()
     assert all(a.destroyed for a in actors)
     assert not bridge._camera_thread.is_alive()
-    assert not bridge.world.settings.synchronous_mode
+    assert not world.settings.synchronous_mode
+    assert bridge.world is None and bridge.client is None
     with pytest.raises(RuntimeError, match="closed"):
         bridge.get_sensor_frame()
 
@@ -390,7 +398,7 @@ def test_close_stops_owned_sensors_thread_and_restores_settings(bridge):
 def test_sync_step_comes_from_avlite(module, monkeypatch, sync_mode, dt):
     from avlite.c40_execution.c49_settings import ExecutionSettings
     monkeypatch.setattr(ExecutionSettings, "c40_sim_dt", dt)
-    bridge = module.Carla4Bridge(module.EgoState(), sync_mode=sync_mode)
+    bridge = module.CarlaBridge(module.EgoState(), sync_mode=sync_mode)
     try:
         assert bridge.fixed_delta_seconds == dt
         assert bridge.world.settings.fixed_delta_seconds == dt
@@ -398,22 +406,24 @@ def test_sync_step_comes_from_avlite(module, monkeypatch, sync_mode, dt):
         assert bridge.get_sensor_frame().lidar.stamp == pytest.approx(dt)
         assert float(bridge.world.blueprints["sensor.lidar.ray_cast"].attrs[
             "rotation_frequency"]) == pytest.approx(1 / dt)
-        with pytest.raises(ValueError, match="per tick"):
-            bridge.step(dt * 2)
-        assert bridge.world.elapsed == pytest.approx(dt)
+        bridge.step(dt * 2)
+        assert bridge.world.elapsed == pytest.approx(dt * 2)
     finally:
         bridge.close()
 
 
 @pytest.mark.parametrize("sync_mode", [None, True])
-def test_sync_requires_avlite_pacing_before_connecting(module, monkeypatch, sync_mode):
+def test_sync_unpaced_still_uses_configured_step(module, monkeypatch, sync_mode):
     from avlite.c40_execution.c49_settings import ExecutionSettings
     monkeypatch.setattr(ExecutionSettings, "c40_pace_sim", False)
-    def unexpected_client(*args):
-        pytest.fail("Invalid timing must be rejected before connecting to CARLA")
-    monkeypatch.setattr(module.carla, "Client", unexpected_client)
-    with pytest.raises(ValueError, match="c40_pace_sim"):
-        module.Carla4Bridge(module.EgoState(), sync_mode=sync_mode)
+    monkeypatch.setattr(ExecutionSettings, "c40_sim_dt", 0.05)
+    bridge = module.CarlaBridge(module.EgoState(), sync_mode=sync_mode)
+    try:
+        assert bridge.fixed_delta_seconds == 0.05
+        bridge.step(0.2)
+        assert bridge.world.elapsed == pytest.approx(0.05)
+    finally:
+        bridge.close()
 
 
 @pytest.mark.parametrize("dt", [0., -.01, float("nan"), float("inf")])
@@ -424,15 +434,15 @@ def test_sync_rejects_invalid_avlite_duration_before_connecting(module, monkeypa
         pytest.fail("Invalid timing must be rejected before connecting to CARLA")
     monkeypatch.setattr(module.carla, "Client", unexpected_client)
     with pytest.raises(ValueError, match="c40_sim_dt must be finite and positive"):
-        module.Carla4Bridge(module.EgoState(), sync_mode=True)
+        module.CarlaBridge(module.EgoState(), sync_mode=True)
 
 
 def test_async_does_not_require_avlite_fixed_timing(module, monkeypatch):
     from avlite.c40_execution.c49_settings import ExecutionSettings
     monkeypatch.setattr(ExecutionSettings, "c40_pace_sim", False)
     monkeypatch.setattr(ExecutionSettings, "c40_sim_dt", float("nan"))
-    monkeypatch.setattr(module.Carla4Bridge, "start_bg_camera_and_state_update", lambda self: None)
-    bridge = module.Carla4Bridge(module.EgoState(), sync_mode=False)
+    monkeypatch.setattr(module.CarlaBridge, "start_bg_camera_and_state_update", lambda self: None)
+    bridge = module.CarlaBridge(module.EgoState(), sync_mode=False)
     try:
         assert bridge.fixed_delta_seconds is None
         assert bridge.world.settings.fixed_delta_seconds is None
@@ -454,15 +464,145 @@ def test_mount_is_proper_optical_rotation(bridge):
 
 
 def test_new_bridge_closes_previous_owner(module):
-    first = module.Carla4Bridge(module.EgoState(), sync_mode=True)
+    first = module.CarlaBridge(module.EgoState(), sync_mode=True)
     first.step(.05)
     first.start_bg_camera_and_state_update()
-    second = module.Carla4Bridge(module.EgoState(), sync_mode=True)
+    second = module.CarlaBridge(module.EgoState(), sync_mode=True)
     try:
         assert first._closed and not first._camera_thread.is_alive()
+        assert first.client is None and first.world is None
         assert module._ACTIVE_BRIDGES[("localhost", 2000)] is second
     finally:
         second.close()
+
+
+def test_close_destroys_sensors_after_inflight_callback(bridge):
+    bridge._ensure_vehicle()
+    bridge.sensor_timeout = 2
+    lidar = bridge._lidar_sensor
+    entered, release = threading.Event(), threading.Event()
+    original = bridge._record_sensor
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original(*args, **kwargs)
+
+    bridge._record_sensor = blocked
+    worker = threading.Thread(target=lambda: bridge.world.deliver("lidar"))
+    worker.start()
+    assert entered.wait(1)
+    closer = threading.Thread(target=bridge.close)
+    closer.start()
+    try:
+        time.sleep(0.05)
+        assert not lidar.destroyed and closer.is_alive()
+        release.set()
+        closer.join(2)
+        worker.join(2)
+    finally:
+        release.set()
+    assert lidar.destroyed and not closer.is_alive() and not worker.is_alive()
+    assert bridge.client is None and bridge.world is None
+
+
+def test_extension_mismatch_is_probed_without_connecting(module, monkeypatch):
+    module.carla.__file__ = "/tmp/carla.cpython-310-x86_64-linux-gnu.so"
+    calls = {"client": 0}
+
+    class Client:
+        def __init__(self, *args):
+            calls["client"] += 1
+
+        def set_timeout(self, timeout):
+            pass
+
+        def load_world(self, name):
+            raise AssertionError("load_world must not run when the child probe fails")
+
+    monkeypatch.setattr(module.carla, "Client", Client)
+    monkeypatch.setattr(
+        module.subprocess, "run",
+        lambda *args, **kwargs: NS(
+            returncode=-6, stdout="", stderr="Simulator API version  = 0.9.16",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="0.9.16"):
+        module.CarlaBridge(module.EgoState(), sync_mode=True)
+    assert calls["client"] == 0
+    assert module._ACTIVE_BRIDGES == {}
+
+
+def test_connection_refused_is_not_a_version_mismatch(module, monkeypatch):
+    module.carla.__file__ = "/tmp/carla.cpython-310-x86_64-linux-gnu.so"
+    calls = {"client": 0}
+
+    class Client:
+        def __init__(self, *args):
+            calls["client"] += 1
+
+    monkeypatch.setattr(module.carla, "Client", Client)
+    monkeypatch.setattr(
+        module.subprocess, "run",
+        lambda *args, **kwargs: NS(
+            returncode=1,
+            stdout="0.10.0\n",
+            stderr="RuntimeError: Connection refused",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not accepting connections") as caught:
+        module.CarlaBridge(module.EgoState(), sync_mode=True)
+    assert "does not match" not in str(caught.value)
+    assert calls["client"] == 0
+    assert module._ACTIVE_BRIDGES == {}
+
+
+def test_matching_child_probe_connects(module, monkeypatch):
+    module.carla.__file__ = "/tmp/carla.cpython-310-x86_64-linux-gnu.so"
+    monkeypatch.setattr(
+        module.subprocess, "run",
+        lambda *args, **kwargs: NS(returncode=0, stdout="0.9.16\n0.9.16\n", stderr=""),
+    )
+    bridge = module.CarlaBridge(module.EgoState(), sync_mode=True)
+    try:
+        assert bridge.client is not None
+    finally:
+        bridge.close()
+
+
+def test_python_api_already_loaded_asks_for_restart(module, monkeypatch):
+    module.carla.__file__ = "/tmp/installed/carla.cpython-310-x86_64-linux-gnu.so"
+    monkeypatch.setattr(module.PluginSettings, "python_api", "/tmp/ue4/carla.egg")
+    with pytest.raises(RuntimeError, match="Restart AVLite"):
+        module.CarlaBridge(module.EgoState(), sync_mode=True)
+    assert module._ACTIVE_BRIDGES == {}
+
+
+def test_version_mismatch_rejected_before_load_world(module, monkeypatch):
+    loaded = {"called": False}
+
+    class Client:
+        def __init__(self, *args):
+            pass
+
+        def set_timeout(self, timeout):
+            pass
+
+        def get_client_version(self):
+            return "0.9.15"
+
+        def get_server_version(self):
+            return "0.10.0"
+
+        def load_world(self, name):
+            loaded["called"] = True
+            raise AssertionError("load_world must not run when versions differ")
+
+    monkeypatch.setattr(module.carla, "Client", Client)
+    with pytest.raises(RuntimeError, match="0.9.15"):
+        module.CarlaBridge(module.EgoState(), sync_mode=True)
+    assert loaded["called"] is False
+    assert module._ACTIVE_BRIDGES == {}
 
 
 def test_real_sync_executor_clock_matches_fake_carla(bridge, module, monkeypatch):

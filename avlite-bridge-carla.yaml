@@ -121,7 +121,7 @@ c30_control:
 
 c40_execution:
   c40_async_combined_perception_planning: true
-  c40_bridge: Carla4Bridge
+  c40_bridge: CarlaBridge
   c40_control_dt: 0.05
   c40_controller: StanleyController
   c40_executer_type: SyncExecuter
@@ -173,5 +173,6 @@ plugins:
     max_sensor_age: 0.5
     seed: 0
     sensor_queue_size: 64
+    python_api: ""
     sensor_timeout: 2.0
     sync_mode: true
